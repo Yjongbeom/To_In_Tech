@@ -1,0 +1,5 @@
+PyGObject==3.42.2
+RPi.GPIO==0.7.1
+pyserial==3.5
+Adafruit-Blinka==8.57.0
+adafruit-circuitpython-ads1x15==2.4.2
