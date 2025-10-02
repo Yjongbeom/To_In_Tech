@@ -1,0 +1,45 @@
+순서
+0. ads1115 address 설정
+1. 라즈베리파이 디스플레이 드라이버 셋팅
+
+sudo vi /boot/firmware/config.txt 맨 아래에 추가
+hdmi_force_hotplug=1
+dtparam=i2c_arm=on
+dtparam=spi=on
+enable_uart=1
+display_rotate=0
+max_usb_current=1
+config_hdmi_boost=7
+hdmi_group=2
+hdmi_mode=1
+hdmi_mode=87
+hdmi_drive=1
+hdmi_cvt 800 480 60 6 0 0 0
+dtoverlay=ads7846,cs=1,penirq=25,penirq_pull=2,speed=50000,keep_vref_on=0,swapxy=0,pmax=255,xohms=150,xmin=200,xmax=3900,ymin=200,ymax=3900
+dtoverlay=i2c-gpio,bus=4,i2c_gpio_sda=5,i2c_gpio_scl=6
+
+2. github clone
+3. venv에 system 패키지 가져오는거까지 설정
+4. requirements.txt 가져오기
+5. 우선순위 권한주기 (sudo setcap cap_sys_nice+ep /usr/bin/python3.11)
+6. splash 화면 설정
+  -> sudo vi /boot/firmware/config.txt
+  -> disable_splash=1 추가(무지개 창 제거)
+  -> sudo vi /boot/firmware/cmdline.txt
+  -> 파일 맨 뒤에 loglevel=3 vt.global_cursor_default=0 추가 console=tty1 -> console=tty3
+(처음 화면에 나오는 라파 로고 정리, 부팅 메시지 삭제, 글자들이 나오게 되는 화면을 없는 화면으로 변경하여 안보이게함)
+  -> sudo cp -r /home/user/Desktop/splash.png /usr/share/plymouth/themes/pix/splash.png
+  -> sudo update-initramfs -u
+
+7. autoboot 설정
+  -> mkdir -p /home/jongbeom/.config/autostart
+  -> vi /home/jongbeom/.config/autostart/autostart_desktop.desktop
+  -> sudo reboot
+[Desktop Entry]
+Type=Application
+Name=Air Pump Controller Autostart
+Comment=Start the air pump control script at login
+Exec=/home/jongbeom/Desktop/run.sh
+저장
+
+8. 시간 동기화
