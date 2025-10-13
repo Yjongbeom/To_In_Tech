@@ -187,7 +187,7 @@ class ControlWindow(Gtk.Window):
         self.display_labels['pressure_val'] = self.create_display_box("공급 압력", "0.0 kPa")
         grid.attach(self.display_labels['pressure_val'], 0, 0, 2, 1)
 
-        self.display_labels['pulse_in_val'] = self.create_display_box("Pulse In", f"{self.pending_freq} Hz")제거
+        self.display_labels['pulse_in_val'] = self.create_display_box("Pulse In", f"{self.pending_freq} Hz")
         grid.attach(self.display_labels['pulse_in_val'], 2, 0, 2, 1)
 
         self.display_labels['pulse_out_vals'] = []
