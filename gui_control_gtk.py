@@ -184,22 +184,15 @@ class ControlWindow(Gtk.Window):
     def create_display_area(self, grid):
         self.display_labels = {}
         
-        # --- 고정 높이 제거 또는 축소 ---
-        # square_height = 150 # 고정 높이가 필요하다면 값을 줄임
-        # ---------------------------
-
         self.display_labels['pressure_val'] = self.create_display_box("공급 압력", "0.0 kPa")
-        # self.display_labels['pressure_val'].set_size_request(-1, square_height) # 고정 높이 제거
         grid.attach(self.display_labels['pressure_val'], 0, 0, 2, 1)
 
-        self.display_labels['pulse_in_val'] = self.create_display_box("Pulse In", f"{self.pending_freq} Hz")
-        # self.display_labels['pulse_in_val'].set_size_request(-1, square_height) # 고정 높이 제거
+        self.display_labels['pulse_in_val'] = self.create_display_box("Pulse In", f"{self.pending_freq} Hz")제거
         grid.attach(self.display_labels['pulse_in_val'], 2, 0, 2, 1)
 
         self.display_labels['pulse_out_vals'] = []
         for i in range(NUM_CHANNELS):
             label = self.create_display_box(f"Pulse Out {i+1}", "0.0 Hz")
-            # label.set_size_request(-1, square_height) # 고정 높이 제거
             self.display_labels['pulse_out_vals'].append(label)
             grid.attach(label, 4 + i, 0, 1, 1)
             
@@ -278,7 +271,6 @@ class ControlWindow(Gtk.Window):
 
     def apply_styles(self):
         css_provider = Gtk.CssProvider()
-        # --- 5인치 화면에 맞게 CSS 수정 ---
         css_data = b"""
             window { background-color: #333; color: white; }
             #display_box { 
@@ -311,7 +303,6 @@ class ControlWindow(Gtk.Window):
             .disconnected { color: #F44336; }
             button { border-radius: 6px; }
         """
-        # ---------------------------------
         css_provider.load_from_data(css_data)
         Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), css_provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
