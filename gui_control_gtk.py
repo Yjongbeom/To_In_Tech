@@ -19,15 +19,12 @@ try:
     for pin in MOSFET_CHANNELS:
         lgpio.gpio_claim_output(LGPIO_HANDLE, pin)
 except Exception as e:
-    print(f"⚠️ lgpio 초기화 실패: {e}")
     LGPIO_HANDLE = -1
 
 try:
     ads = Adafruit_ADS1x15.ADS1115(busnum=4)
     GAIN = 1
-    print("✅ I2C 버스 4번으로 ADC 초기화 성공.")
 except Exception as e:
-    print(f"⚠️ I2C 버스 4번 ADC 초기화 실패: {e}")
     ads = None
 
 i2c_lock = threading.Lock()
