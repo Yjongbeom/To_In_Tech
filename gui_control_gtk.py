@@ -10,22 +10,115 @@ import os
 from datetime import datetime
 import subprocess
 import gc
+import serial
+
+SOH, STX, ETX, EOT, US = b'\x01', b'\x02', b'\x03', b'\x04', b'\x1F'
+DIRECTION_SDC_TO_GW = b'\x30'
+PRIMITIVE_DATA_SEND = b'2'
 
 MOSFET_CHANNELS = [12, 13, 19, 16]
 NUM_CHANNELS = len(MOSFET_CHANNELS)
+RS485_DE_PIN = 18
+
+def calculate_checksum(packet_data: bytes) -> int:
+    return sum(packet_data) & 0xFF
+
+def encode_sensor_data_packet(pressure_val: float, output_hz_val: float, freq: int) -> bytes:
+    """    
+    param pressure_val: 압력 값 (kPa)
+    param output_hz_val: 측정된 출력 주파수 (Hz)
+    param freq: 설정된(입력) 주파수 (Hz)
+    return: 인코딩된 바이트 패킷
+    """
+    try:
+        data_payload_str = f"{pressure_val:.1f}{US.decode()}{output_hz_val:.1f}"
+        data_payload_bytes = data_payload_str.encode('ascii')
+        
+        data_counter = (2).to_bytes(1, 'big') 
+        
+        stx_to_etx_payload = STX + data_counter + data_payload_bytes + ETX
+        
+        primitive = PRIMITIVE_DATA_SEND
+        frequency_level = (freq & 0xFF).to_bytes(1, 'big')
+        
+        main_packet_part = DIRECTION_SDC_TO_GW + primitive + frequency_level + stx_to_etx_payload
+        length_field = (len(main_packet_part) + 4).to_bytes(1, 'big')
+        
+        checksum_data = length_field + main_packet_part + EOT
+        checksum = calculate_checksum(checksum_data).to_bytes(1, 'big')
+        
+        final_packet = (SOH + checksum + length_field + main_packet_part + EOT)
+        
+        return final_packet
+    except Exception as e:
+        print(f"패킷 인코딩 오류: {e}")
+        return b''
+
+
+def decode_packet(packet: bytes) -> dict:
+    """
+    수신된 프로토콜 패킷을 디코딩합니다.
+    
+    :param packet: 수신된 바이트 패킷
+    :return: 디코딩된 데이터를 담은 딕셔너리
+    """
+    res = {'raw_hex': packet.hex(' ')}
+    
+    if not packet.startswith(SOH) or not packet.endswith(EOT) or len(packet) < 8:
+        res.update({'status': 'ERROR', 'reason': 'Invalid Frame (SOH/EOT/Length)'})
+        return res
+    
+    received_len_val = packet[2]
+    
+    if len(packet) != received_len_val:
+        res.update({'status': 'ERROR', 'reason': f'Length Mismatch (Got: {len(packet)}, Expected: {received_len_val})'})
+        return res
+    
+    received_checksum = packet[1]
+
+    calculated_checksum = calculate_checksum(packet[2:])
+    
+    if received_checksum != calculated_checksum:
+        res.update({'status': 'ERROR', 'reason': f'Checksum Mismatch (Got: {received_checksum}, Expected: {calculated_checksum})'})
+        return res
+    
+    try:
+        res['status'] = 'OK'
+        res['direction'] = 'SDC -> Gateway' if packet[3:4] == DIRECTION_SDC_TO_GW else 'Unknown'
+        res['primitive'] = packet[4:5].decode('ascii')
+        res['frequency'] = int(packet[5])
+        
+        stx_index = packet.find(STX)
+        etx_index = packet.find(ETX)
+        
+        if stx_index != -1 and etx_index != -1:
+            data_part = packet[stx_index + 2 : etx_index].decode('ascii').split(US.decode())
+            if len(data_part) >= 2:
+                res['pressure'] = f"{float(data_part[0]):.1f} kPa"
+                res['output_hz'] = f"{float(data_part[1]):.1f} Hz"
+    except Exception as e:
+        res.update({'status': 'ERROR', 'reason': f'Parsing Failed: {e}'})
+        
+    return res
 
 try:
     LGPIO_HANDLE = lgpio.gpiochip_open(4)
     for pin in MOSFET_CHANNELS:
         lgpio.gpio_claim_output(LGPIO_HANDLE, pin)
+    
+    lgpio.gpio_claim_output(LGPIO_HANDLE, RS485_DE_PIN)
+    lgpio.gpio_write(LGPIO_HANDLE, RS485_DE_PIN, 0)
+    
 except Exception as e:
     LGPIO_HANDLE = -1
+    print(f"LGPIO 초기화 실패: {e}")
 
 try:
     ads = Adafruit_ADS1x15.ADS1115(busnum=4)
     GAIN = 1
 except Exception as e:
     ads = None
+    print(f"ADS1115 초기화 실패: {e}")
 
 i2c_lock = threading.Lock()
 
@@ -43,7 +136,7 @@ def setup_logging():
             os.makedirs(LOG_DIRECTORY)
         current_hour = datetime.now().hour
         last_log_hour = current_hour
-        timestamp = time.strftime("%Y-%m-%d_%H-00-00")
+        timestamp = time.strftime("%Y-m-%d_%H-00-00")
         log_file_path = os.path.join(LOG_DIRECTORY, f"{timestamp}_system.log")
         print(f"시스템 로그 파일이 '{log_file_path}'에 생성됩니다.")
     except Exception as e:
@@ -56,11 +149,11 @@ def check_and_rotate_log():
     is_forward_in_time = (current_hour > last_log_hour)
 
     if is_midnight_rollover or is_forward_in_time:
-        today_str = time.strftime("%Y-%m-%d")
+        today_str = time.strftime("%Y-m-%d")
         LOG_DIRECTORY = os.path.join(BASE_LOG_DIR, today_str)
         if not os.path.isdir(LOG_DIRECTORY):
             os.makedirs(LOG_DIRECTORY)
-        timestamp = time.strftime("%Y-%m-%d_%H-00-00")
+        timestamp = time.strftime("%Y-m-%d_%H-00-00")
         new_log_file_path = os.path.join(LOG_DIRECTORY, f"{timestamp}_system.log")
         log_file_path = new_log_file_path
         last_log_hour = current_hour
@@ -75,9 +168,13 @@ def log_message(level, message, data=None):
             output_hz_str = ", ".join([f"{hz:.1f}" for hz in data['output_hz_list']])
             timestamp = datetime.now().strftime('%Y%m%d %H:%M:%S')
             log_entry = f"{timestamp}, {data['input_hz']}, {data['pressure']:.1f}, {output_hz_str}\n"
+        elif level == "PACKET_TX":
+            timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            log_entry = f"[{timestamp_str}] [{level}] {message}\n"
         else:
             timestamp_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
             log_entry = f"[{timestamp_str}] [{level}] {message}\n"
+            
         with open(log_file_path, "a", encoding='utf-8') as f:
             f.write(log_entry)
     except Exception as e:
@@ -141,7 +238,7 @@ class FrequencyMonitor(threading.Thread):
 class ControlWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="Air Pump Controller")
-        self.set_default_size(800, 480) # 5인치 해상도(예: 800x480)에 맞게 설정
+        self.set_default_size(800, 480)
         self.move(0, 0)
         self.set_decorated(False)
         self.fullscreen()
@@ -154,6 +251,21 @@ class ControlWindow(Gtk.Window):
         self.latest_pressure_kpa = 0.0
         self.output_frequencies = [0.0] * NUM_CHANNELS
         self.sensor_lock = threading.Lock()
+        
+        try:
+            self.serial_port = serial.Serial(
+                port="/dev/ttyS0", # 실제 COM 보고 변경해야됨
+                baudrate=9600,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                bytesize=serial.EIGHTBITS,
+                timeout=0.1
+            )
+            print(f"RS-485 시리얼 포트 /dev/ttyS0 @ 9600bps 열기 성공")
+        except Exception as e:
+            self.serial_port = None
+            print(f"RS-485 시리얼 포트 열기 실패: {e}")
+
 
         self.sensor_reader_thread = threading.Thread(target=self.high_speed_sensor_reader, daemon=True)
         self.sensor_reader_thread.start()
@@ -161,9 +273,7 @@ class ControlWindow(Gtk.Window):
         self.freq_monitor_1 = FrequencyMonitor(1)
         self.freq_monitor_1.start()
         
-        # --- 레이아웃 간격 축소 ---
         main_grid = Gtk.Grid(column_spacing=10, row_spacing=10, margin=10)
-        # ------------------------
         main_grid.set_hexpand(True) 
         main_grid.set_vexpand(True) 
         main_grid.set_column_homogeneous(True)
@@ -177,6 +287,7 @@ class ControlWindow(Gtk.Window):
         self.apply_styles()
         
         GLib.timeout_add(100, self.update_gui)
+        GLib.timeout_add(1000, self.send_sensor_data)
 
     def create_display_area(self, grid):
         self.display_labels = {}
@@ -333,6 +444,7 @@ class ControlWindow(Gtk.Window):
             if ads is None:
                 time.sleep(0.1)
                 continue
+            
             pressure = self.read_pressure_sensor()
             output_hz_1 = self.freq_monitor_1.get_frequency()
             
@@ -340,7 +452,6 @@ class ControlWindow(Gtk.Window):
                 with self.sensor_lock:
                     self.latest_pressure_kpa = pressure
                     self.output_frequencies[0] = output_hz_1
-                    
             time.sleep(0.002)
 
     def read_pressure_sensor(self):
@@ -374,6 +485,43 @@ class ControlWindow(Gtk.Window):
         
         return True
 
+    def send_sensor_data(self):
+        if not self.run_thread:
+            return False
+
+        try:
+            with self.sensor_lock:
+                pressure = self.latest_pressure_kpa
+                output_hz = self.output_frequencies[0] 
+            
+            input_freq = self.active_freq
+            
+            packet = encode_sensor_data_packet(pressure, output_hz, input_freq)
+            
+            if packet and self.serial_port and LGPIO_HANDLE >= 0:
+                try:
+                    lgpio.gpio_write(LGPIO_HANDLE, RS485_DE_PIN, 1)
+                    time.sleep(0.002)
+                    
+                    self.serial_port.write(packet)
+                    self.serial_port.flush()
+                    
+                    tx_time = (len(packet) * 10) / 9600 
+                    time.sleep(tx_time + 0.01)
+                    
+                    lgpio.gpio_write(LGPIO_HANDLE, RS485_DE_PIN, 0)
+
+                except Exception as e:
+                    print("RS-485 전송 오류:", e)
+                    try:
+                        lgpio.gpio_write(LGPIO_HANDLE, RS485_DE_PIN, 0)
+                    except Exception:
+                        pass
+                
+        except Exception as e:
+            print("센서 데이터 전송 오류:", e)
+        return True
+
     def update_connection_status(self, current_output_freqs):
         is_connected_1 = not (self.motor_running and current_output_freqs[0] < 1.0)
         self.set_label_connection_style(self.channel_status_labels[0], is_connected_1)
@@ -391,15 +539,25 @@ class ControlWindow(Gtk.Window):
             context.add_class("disconnected")
 
     def on_destroy(self, *args):
-        log_message("INFO", "GUI 창이 닫혔습니다. 리소스 해제 중...")
         self.run_thread = False
         self.freq_monitor_1.stop()
         
         time.sleep(0.2)
         if LGPIO_HANDLE >= 0:
+            try:
+                lgpio.gpio_write(LGPIO_HANDLE, RS485_DE_PIN, 0)
+            except Exception:
+                pass
             for pin in MOSFET_CHANNELS:
-                lgpio.tx_pwm(LGPIO_HANDLE, pin, 10, 0)
+                try:
+                    lgpio.tx_pwm(LGPIO_HANDLE, pin, 10, 0)
+                except Exception:
+                    pass
             lgpio.gpiochip_close(LGPIO_HANDLE)
+        
+        if self.serial_port:
+            self.serial_port.close()
+            print("RS-485 시리얼 포트 닫힘")
         
         Gtk.main_quit()
 
@@ -407,12 +565,15 @@ if __name__ == "__main__":
     try:
         os.nice(-20)
     except Exception as e:
-        print(f"프로세스 우선순위 설정 오류: {e}")
+        print(f"프로세스 우선순위 설정 오류: {e} (관리자 권한 필요)")
 
     import signal
     signal.signal(signal.SIGINT, signal.SIG_DFL)
+    
     setup_logging()
+    
     win = ControlWindow()
     win.connect("destroy", win.on_destroy)
     win.show_all()
+    
     Gtk.main()
