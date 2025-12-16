@@ -42,4 +42,5 @@ Comment=Start the air pump control script at login
 Exec=/home/jongbeom/Desktop/run.sh
 저장
 
-8. 시간 동기화
+8. 시간 동기화 NTP RTC?
+

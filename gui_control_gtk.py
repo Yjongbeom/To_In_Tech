@@ -2,8 +2,16 @@ import gi
 gi.require_version("Gtk", "3.0")
 from gi.repository import Gtk, Gdk, GLib, Pango
 
+# --- I²C 라이브러리 수정 ---
+import board
+import digitalio 
+import adafruit_bitbangio as bitbangio # <--- 새로운 라이브러리 사용
+import adafruit_ads1x15.ads1115 as ADS 
+import adafruit_ina219 
+# --------------------------
+
+# 기존 라이브러리 및 모듈
 import lgpio
-import Adafruit_ADS1x15
 import time
 import threading
 import os
@@ -11,20 +19,38 @@ from datetime import datetime
 import subprocess
 import gc
 import serial
+import signal
 
+# --- 프로토콜 및 핀 설정 상수 ---
 SOH, STX, ETX, EOT, US = b'\x01', b'\x02', b'\x03', b'\x04', b'\x1F'
 DIRECTION_SDC_TO_GW = b'\x30'
 PRIMITIVE_DATA_SEND = b'2'
 
-MOSFET_CHANNELS = [12, 13, 19, 16]
+MOSFET_CHANNELS = [12, 13, 19, 16] # PWM 채널
 NUM_CHANNELS = len(MOSFET_CHANNELS)
-RS485_DE_PIN = 18
+RS485_DE_PIN = 26 # GPIO 26 사용 (MAX485 DE/RE 제어)
+UART_PORT = "/dev/ttyAMA4" # 로그에 잡힌 UART4 포트
+
+# --- I²C 핀 및 주소 설정 ---
+# board.D6과 board.D20은 디지털 핀 객체를 생성하여 bitbangio에 전달합니다.
+I2C_SDA_PIN = board.D6  # GPIO 6 (소프트웨어 I²C SDA)
+I2C_SCL_PIN = board.D20 # GPIO 20 (소프트웨어 I²C SCL)
+ADS1115_ADDRESS = 0x48 # ADS1115 기본 I²C 주소
+INA219_ADDRESSES = [0x40, 0x41, 0x44, 0x45] # INA219 주소 전체 반영
+
+# --- ADC 및 I²C 전역 변수 ---
+i2c_lock = threading.Lock()
+ZERO_PRESSURE_VOLTAGE = 0.19825
+VOLTAGE_PER_KPA = 0.03875 / 50
+GAIN = 1 # ADS1115 Gain
+
+# --- 함수 정의 (calculate_checksum, encode_sensor_data_packet, decode_packet) ---
 
 def calculate_checksum(packet_data: bytes) -> int:
     return sum(packet_data) & 0xFF
 
 def encode_sensor_data_packet(pressure_val: float, output_hz_val: float, freq: int) -> bytes:
-    """    
+    """ 
     param pressure_val: 압력 값 (kPa)
     param output_hz_val: 측정된 출력 주파수 (Hz)
     param freq: 설정된(입력) 주파수 (Hz)
@@ -58,9 +84,6 @@ def encode_sensor_data_packet(pressure_val: float, output_hz_val: float, freq: i
 def decode_packet(packet: bytes) -> dict:
     """
     수신된 프로토콜 패킷을 디코딩합니다.
-    
-    :param packet: 수신된 바이트 패킷
-    :return: 디코딩된 데이터를 담은 딕셔너리
     """
     res = {'raw_hex': packet.hex(' ')}
     
@@ -101,6 +124,7 @@ def decode_packet(packet: bytes) -> dict:
         
     return res
 
+# --- LGPIO 초기화 ---
 try:
     LGPIO_HANDLE = lgpio.gpiochip_open(4)
     for pin in MOSFET_CHANNELS:
@@ -113,15 +137,49 @@ except Exception as e:
     LGPIO_HANDLE = -1
     print(f"LGPIO 초기화 실패: {e}")
 
+# I²C 버스 및 ADS1115/INA219 초기화
+ads = None
+ina_channels = {}
+I2C_BUS = None 
+
 try:
-    ads = Adafruit_ADS1x15.ADS1115(busnum=4)
-    GAIN = 1
+    # 1. GPIO 핀을 디지털 입출력 객체로 정의 (bitbangio는 핀 객체보다는 board.Dx 핀을 선호하지만, digitalio로도 가능)
+    # 여기서는 bitbangio의 I2C(scl, sda) 생성자에 맞춰 핀을 직접 전달합니다.
+    
+    # 2. bitbangio.I2C 객체를 생성
+    try:
+        # bitbangio.I2C(scl_pin, sda_pin) 형태로 생성합니다.
+        # adafruit_bitbangio는 board.D20, board.D6과 같은 객체를 직접 지원합니다.
+        I2C_BUS = bitbangio.I2C(I2C_SCL_PIN, I2C_SDA_PIN) 
+        print("소프트웨어 I²C 버스 (GPIO 6/20) 초기화 성공 (bitbangio)")
+    except Exception as e:
+        print(f"I²C 버스 객체 생성 실패: {e}")
+
+    # 3. I2C_BUS가 성공적으로 생성되었을 때만 센서 초기화 시도
+    if I2C_BUS is not None:
+        try:
+            # ADS1115 초기화 (압력 센서용)
+            ads = ADS.ADS1115(I2C_BUS, address=ADS1115_ADDRESS)
+            
+            # INA219 초기화 (전류 센서용)
+            for addr in INA219_ADDRESSES:
+                try:
+                    ina = adafruit_ina219.INA219(I2C_BUS, addr=addr)
+                    ina_channels[addr] = ina
+                    print(f"INA219 (0x{addr:X}) 초기화 성공")
+                except Exception as e:
+                    print(f"INA219 (0x{addr:X}) 초기화 실패: {e}")
+            
+        except Exception as e:
+            ads = None
+            print(f"I²C 센서(ADS/INA) 초기화 중 오류 발생: {e}")
+
+
 except Exception as e:
-    ads = None
-    print(f"ADS1115 초기화 실패: {e}")
+    print(f"I²C 장치 초기화 치명적인 오류: {e}")
 
-i2c_lock = threading.Lock()
 
+# --- 로깅 함수 ---
 BASE_LOG_DIR = os.path.join(os.path.expanduser('~'), 'Desktop', '로그파일')
 LOG_DIRECTORY = ""
 log_file_path = ""
@@ -136,7 +194,7 @@ def setup_logging():
             os.makedirs(LOG_DIRECTORY)
         current_hour = datetime.now().hour
         last_log_hour = current_hour
-        timestamp = time.strftime("%Y-m-%d_%H-00-00")
+        timestamp = time.strftime("%Y-%m-%d_%H-00-00")
         log_file_path = os.path.join(LOG_DIRECTORY, f"{timestamp}_system.log")
         print(f"시스템 로그 파일이 '{log_file_path}'에 생성됩니다.")
     except Exception as e:
@@ -149,11 +207,11 @@ def check_and_rotate_log():
     is_forward_in_time = (current_hour > last_log_hour)
 
     if is_midnight_rollover or is_forward_in_time:
-        today_str = time.strftime("%Y-m-%d")
+        today_str = time.strftime("%Y-%m-%d")
         LOG_DIRECTORY = os.path.join(BASE_LOG_DIR, today_str)
         if not os.path.isdir(LOG_DIRECTORY):
             os.makedirs(LOG_DIRECTORY)
-        timestamp = time.strftime("%Y-m-%d_%H-00-00")
+        timestamp = time.strftime("%Y-%m-%d_%H-00-00")
         new_log_file_path = os.path.join(LOG_DIRECTORY, f"{timestamp}_system.log")
         log_file_path = new_log_file_path
         last_log_hour = current_hour
@@ -179,10 +237,8 @@ def log_message(level, message, data=None):
             f.write(log_entry)
     except Exception as e:
         print(f"로그 기록 오류: {e}")
-
-ZERO_PRESSURE_VOLTAGE = 0.19825
-VOLTAGE_PER_KPA = 0.03875 / 50
-
+        
+# --- FrequencyMonitor 클래스 (I²C Lock 적용) ---
 class FrequencyMonitor(threading.Thread):
     def __init__(self, adc_channel):
         super().__init__()
@@ -202,8 +258,10 @@ class FrequencyMonitor(threading.Thread):
                 time.sleep(0.1)
                 continue
             try:
-                with i2c_lock:
-                    raw_value = ads.read_adc(self.adc_channel, gain=GAIN)
+                # I²C 락을 사용하여 ADS1115 접근 보호
+                with i2c_lock: 
+                    raw_value = ads.read_adc(self.adc_channel, gain=GAIN) 
+                
                 measured_voltage = raw_value * 4.096 / 32767.0
                 
                 pseudo_current = (measured_voltage - 1.25) / 0.185
@@ -235,6 +293,8 @@ class FrequencyMonitor(threading.Thread):
     def stop(self):
         self.running = False
 
+
+# --- ControlWindow 클래스 ---
 class ControlWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="Air Pump Controller")
@@ -249,23 +309,24 @@ class ControlWindow(Gtk.Window):
         self.pending_freq = 10
 
         self.latest_pressure_kpa = 0.0
+        self.latest_current_ma = 0.0
         self.output_frequencies = [0.0] * NUM_CHANNELS
         self.sensor_lock = threading.Lock()
         
+        # RS-485 시리얼 포트 설정: /dev/ttyAMA4 사용
         try:
             self.serial_port = serial.Serial(
-                port="/dev/ttyS0", # 실제 COM 보고 변경해야됨
+                port=UART_PORT,
                 baudrate=9600,
                 parity=serial.PARITY_NONE,
                 stopbits=serial.STOPBITS_ONE,
                 bytesize=serial.EIGHTBITS,
                 timeout=0.1
             )
-            print(f"RS-485 시리얼 포트 /dev/ttyS0 @ 9600bps 열기 성공")
+            print(f"RS-485 시리얼 포트 {UART_PORT} @ 9600bps 열기 성공")
         except Exception as e:
             self.serial_port = None
             print(f"RS-485 시리얼 포트 열기 실패: {e}")
-
 
         self.sensor_reader_thread = threading.Thread(target=self.high_speed_sensor_reader, daemon=True)
         self.sensor_reader_thread.start()
@@ -295,14 +356,18 @@ class ControlWindow(Gtk.Window):
         self.display_labels['pressure_val'] = self.create_display_box("공급 압력", "0.0 kPa")
         grid.attach(self.display_labels['pressure_val'], 0, 0, 2, 1)
 
+        # pulse_in_val 복구
         self.display_labels['pulse_in_val'] = self.create_display_box("Pulse In", f"{self.pending_freq} Hz")
         grid.attach(self.display_labels['pulse_in_val'], 2, 0, 2, 1)
 
+        self.display_labels['current_val'] = self.create_display_box("전류 (INA)", "0.0 mA")
+        grid.attach(self.display_labels['current_val'], 4, 0, 2, 1) # 컬럼 4로 재조정
+        
         self.display_labels['pulse_out_vals'] = []
         for i in range(NUM_CHANNELS):
             label = self.create_display_box(f"Pulse Out {i+1}", "0.0 Hz")
             self.display_labels['pulse_out_vals'].append(label)
-            grid.attach(label, 4 + i, 0, 1, 1)
+            grid.attach(label, 6 + i, 0, 1, 1) # 컬럼 6에서 시작하도록 재조정
             
     def create_display_box(self, title_text, value_text):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -319,7 +384,7 @@ class ControlWindow(Gtk.Window):
         control_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10, halign=Gtk.Align.CENTER)
         control_box.set_vexpand(True)
         control_box.set_valign(Gtk.Align.CENTER)
-        grid.attach(control_box, 0, 1, 4 + NUM_CHANNELS, 1)
+        grid.attach(control_box, 0, 1, 4 + NUM_CHANNELS + 2, 1) # 컬럼 수 조정
 
         up_button = Gtk.Button(label="▲")
         up_button.connect("clicked", self.on_up_down_clicked, 1)
@@ -351,11 +416,15 @@ class ControlWindow(Gtk.Window):
         self.channel_status_labels = []
         status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0, halign=Gtk.Align.CENTER)
         status_box.set_name("status_bar")
-        grid.attach(status_box, 0, 2, 4 + NUM_CHANNELS, 1)
+        grid.attach(status_box, 0, 2, 4 + NUM_CHANNELS + 2, 1) # 컬럼 수 조정
         
         pressure_status = Gtk.Label(label="압력")
         pressure_status.set_name("status_item")
         status_box.pack_start(pressure_status, True, True, 0)
+        
+        current_status = Gtk.Label(label="전류")
+        current_status.set_name("status_item")
+        status_box.pack_start(current_status, True, True, 0)
 
         for i in range(NUM_CHANNELS):
             label = Gtk.Label(label=f"{i+1}")
@@ -366,7 +435,7 @@ class ControlWindow(Gtk.Window):
     def create_system_buttons(self, grid):
         bottom_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, margin_top=5)
         bottom_box.set_valign(Gtk.Align.END)
-        grid.attach(bottom_box, 0, 3, 4 + NUM_CHANNELS, 1)
+        grid.attach(bottom_box, 0, 3, 4 + NUM_CHANNELS + 2, 1) # 컬럼 수 조정
         
         log_dir_button = Gtk.Button(label="로그파일")
         log_dir_button.connect("clicked", lambda w: subprocess.Popen(['xdg-open', BASE_LOG_DIR]))
@@ -446,22 +515,35 @@ class ControlWindow(Gtk.Window):
                 continue
             
             pressure = self.read_pressure_sensor()
+            current_ma = self.read_current_sensor()
             output_hz_1 = self.freq_monitor_1.get_frequency()
             
             if pressure is not None:
                 with self.sensor_lock:
                     self.latest_pressure_kpa = pressure
+                    self.latest_current_ma = current_ma if current_ma is not None else 0.0
                     self.output_frequencies[0] = output_hz_1
             time.sleep(0.002)
 
     def read_pressure_sensor(self):
         try:
             with i2c_lock:
-                raw_value = ads.read_adc(0, gain=GAIN)
+                raw_value = ads.read_adc(0, gain=GAIN) 
             measured_voltage = raw_value * 4.096 / 32767.0
             pressure_kpa = (measured_voltage - ZERO_PRESSURE_VOLTAGE) / VOLTAGE_PER_KPA
             return max(0.0, pressure_kpa)
-        except Exception:
+        except Exception as e:
+            return None
+
+    def read_current_sensor(self):
+        try:
+            if ina_channels:
+                with i2c_lock:
+                    first_ina = next(iter(ina_channels.values())) 
+                    current_ma = first_ina.current 
+                    return current_ma
+            return None
+        except Exception as e:
             return None
 
     def update_gui(self):
@@ -470,9 +552,11 @@ class ControlWindow(Gtk.Window):
 
         with self.sensor_lock:
             current_pressure = self.latest_pressure_kpa
+            current_current = self.latest_current_ma
             current_output_freqs = list(self.output_frequencies)
 
         self.display_labels['pressure_val'].get_children()[1].set_text(f"{current_pressure:.1f} kPa")
+        self.display_labels['current_val'].get_children()[1].set_text(f"{current_current:.1f} mA")
         self.display_labels['pulse_in_val'].get_children()[1].set_text(f"{self.pending_freq} Hz")
         
         for i in range(NUM_CHANNELS):
@@ -500,16 +584,21 @@ class ControlWindow(Gtk.Window):
             
             if packet and self.serial_port and LGPIO_HANDLE >= 0:
                 try:
+                    # 1. DE 핀 HIGH (송신 모드)
                     lgpio.gpio_write(LGPIO_HANDLE, RS485_DE_PIN, 1)
                     time.sleep(0.002)
                     
+                    # 2. 데이터 송신
                     self.serial_port.write(packet)
                     self.serial_port.flush()
                     
-                    tx_time = (len(packet) * 10) / 9600 
-                    time.sleep(tx_time + 0.01)
+                    # 3. 데이터 송신 완료 대기 (정확한 RS-485 제어)
+                    tx_time = (len(packet) * 10) / 9600
+                    time.sleep(tx_time + 0.005)
                     
+                    # 4. DE 핀 LOW (수신 모드 복귀)
                     lgpio.gpio_write(LGPIO_HANDLE, RS485_DE_PIN, 0)
+                    log_message("PACKET_TX", f"Sent: {packet.hex()}")
 
                 except Exception as e:
                     print("RS-485 전송 오류:", e)
@@ -545,7 +634,8 @@ class ControlWindow(Gtk.Window):
         time.sleep(0.2)
         if LGPIO_HANDLE >= 0:
             try:
-                lgpio.gpio_write(LGPIO_HANDLE, RS485_DE_PIN, 0)
+                # 종료 시 DE 핀 LOW 확인
+                lgpio.gpio_write(LGPIO_HANDLE, RS485_DE_PIN, 0) 
             except Exception:
                 pass
             for pin in MOSFET_CHANNELS:
@@ -558,7 +648,7 @@ class ControlWindow(Gtk.Window):
         if self.serial_port:
             self.serial_port.close()
             print("RS-485 시리얼 포트 닫힘")
-        
+            
         Gtk.main_quit()
 
 if __name__ == "__main__":
@@ -567,7 +657,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"프로세스 우선순위 설정 오류: {e} (관리자 권한 필요)")
 
-    import signal
     signal.signal(signal.SIGINT, signal.SIG_DFL)
     
     setup_logging()
