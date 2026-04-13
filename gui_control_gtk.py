@@ -76,6 +76,7 @@ RS485_DE_PIN = 27
 def calculate_checksum(packet_data: bytes) -> int:
     return sum(packet_data) & 0xFF
 
+
 def encode_sensor_data_packet(pressure_val: float, hz_list: list, freq: int) -> bytes:
     try:
         hz_str = US.decode().join([f"{h:.1f}" for h in hz_list])
@@ -99,6 +100,7 @@ def encode_sensor_data_packet(pressure_val: float, hz_list: list, freq: int) -> 
         return b''
 
 GPIO.setmode(GPIO.BCM)
+
 i2c = busio.I2C(board.SCL, board.SDA)
 i2c_lock = threading.Lock()
 
@@ -144,7 +146,7 @@ class FrequencyMonitor(threading.Thread):
         self.running = True
         self.lock = threading.Lock()
         self._frequency = 0.0
-        self.CURRENT_THRESHOLD = 80.0 
+        self.CURRENT_THRESHOLD = 35.0 
         self.SAMPLING_INTERVAL = 0.002
 
     def run(self):
@@ -331,9 +333,9 @@ class ControlWindow(Gtk.Window):
         css_provider = Gtk.CssProvider()
         css_data = b"""
         window { background-color: #333; color: white; }
-        #display_box { background-color: #111; border: 2px solid #555; border-radius: 8px; padding: 10px; }
+        #display_box { background-color: #111; border: 2px solid #555; border-radius: 4px; padding: 6px; }
         #display_title { font-size: 14pt; font-weight: bold; color: #AAA; }
-        #display_value { font-size: 25pt; font-weight: bold; color: white; }
+        #display_value { font-size: 15pt; font-weight: bold; color: white;}
         #control_button_arrow { font-size: 45pt; min-height: 120px; border-radius: 12px;}
         #control_button_set { font-size: 35pt; font-weight: bold; background-color: #2196F3; color: white; min-height: 80px; }
         #control_button_stop { font-size: 35pt; font-weight: bold; background-color: #F44336; color: white; min-height: 80px; }
@@ -378,7 +380,7 @@ class ControlWindow(Gtk.Window):
                     try:
                         with i2c_lock: volt_results[i-1] = self.ina_sensors[i].bus_voltage
                     except: pass
-
+            
             with self.sensor_lock:
                 if pressure is not None: self.latest_pressure_kpa = pressure
                 self.output_frequencies = freq_results
